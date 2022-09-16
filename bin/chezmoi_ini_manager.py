@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from sys import stdin, stderr
-from typing import Generator, TextIO, Callable, Literal, Optional, Iterable, Any
+from typing import Generator, TextIO, Callable, Literal, Optional, Iterable, Any, Tuple, Set, Dict, List, Union
 
 # This regex is silly because of stuff like "[Colors:Header][Inactive]" in kde configs
 _RE_SECTION = re.compile(r"\[(?P<name>[^\n]+)\].*")
@@ -35,14 +35,10 @@ class LineType(enum.Enum):
 
 
 # Return type of load_ini. Written to be used together with match.
-LineState = (
-    tuple[Literal[LineType.Comment], str]
-    | tuple[Literal[LineType.SectionHeader], str, str]
-    | tuple[Literal[LineType.KeyValue], str, str, str, str]
-)
+LineState = Any
 
 # Raw line, value
-KeyLineState = tuple[str, str]
+KeyLineState = Tuple[str, str]
 
 # A transform takes two lines and merges them
 # Args: section, key, source data, target data
@@ -53,10 +49,10 @@ Transform = Callable[[str, str, Optional[KeyLineState], Optional[KeyLineState]],
 class Mutations:
     """Collects all the ways we can ignore, transform etc (mutations)"""
 
-    ignore_sections: set[str]
-    ignore_keys: set[tuple[str, str]]
-    ignore_regexes: list[tuple[re.Pattern, re.Pattern]]
-    transforms: dict[tuple[str, str], Transform]
+    ignore_sections: Set[str]
+    ignore_keys: Set[Tuple[str, str]]
+    ignore_regexes: List[Tuple[re.Pattern, re.Pattern]]
+    transforms: Dict[Tuple[str, str], Transform]
 
 
 class ParseException(Exception):
@@ -65,7 +61,7 @@ class ParseException(Exception):
     pass
 
 
-def load_ini(file: TextIO | Iterable[str]) -> Generator[LineState, None, None]:
+def load_ini(file: Union[TextIO, Iterable[str]]) -> Generator[LineState, None, None]:
     """
     This function parses an INI. Intended to be combined with a match statement
 
@@ -93,12 +89,12 @@ def load_ini(file: TextIO | Iterable[str]) -> Generator[LineState, None, None]:
 
 
 # Section -> Raw Line
-SourceSections = dict[str, str]
+SourceSections = Dict[str, str]
 # Section -> Key -> (Raw line, value)
-SourceKvs = dict[str, dict[str, tuple[str, str]]]
+SourceKvs = Dict[str, Dict[str, Tuple[str, str]]]
 
 
-def load_into_dict(file: TextIO | Iterable[str]) -> tuple[SourceSections, SourceKvs]:
+def load_into_dict(file: Union[TextIO, Iterable[str]]) -> Tuple[SourceSections, SourceKvs]:
     """
     Load the file into a dictionary
 
@@ -110,18 +106,23 @@ def load_into_dict(file: TextIO | Iterable[str]) -> tuple[SourceSections, Source
     kvs = {}
     for data in load_ini(file):
         try:
-            match data:
-                case (LineType.Comment, _):
-                    pass
-                case (LineType.SectionHeader, line, section):
-                    sections[section] = line
-                    kvs[section] = {}
-                case (LineType.KeyValue, line, section, key, value):
-                    if section is OUTSIDE_SECTION and OUTSIDE_SECTION not in kvs:
-                        # dolphinrc (and some other programs) has a key before the first section. Blergh.
-                        sections[OUTSIDE_SECTION] = None
-                        kvs[OUTSIDE_SECTION] = {}
-                    kvs[section][key] = line, value
+            if (len(data) > 1) and (data[0] is LineType.Comment):
+                pass
+            elif (len(data) > 2) and (data[0] is LineType.SectionHeader):
+                line = data[1]
+                section = data[2]
+                sections[section] = line
+                kvs[section] = {}
+            elif (len(data) > 4) and (data[0] is LineType.KeyValue):
+                line = data[1]
+                section = data[2]
+                key = data[3]
+                value = data[4]
+                if section is OUTSIDE_SECTION and OUTSIDE_SECTION not in kvs:
+                    # dolphinrc (and some other programs) has a key before the first section. Blergh.
+                    sections[OUTSIDE_SECTION] = None
+                    kvs[OUTSIDE_SECTION] = {}
+                kvs[section][key] = line, value
         except Exception as e:
             raise ParseException(f"Error while processing data {data}") from e
     return sections, kvs
@@ -152,7 +153,7 @@ def is_key_ignored(section: str, key: str, mutations: Mutations) -> bool:
 
 
 def process_target(
-    file: TextIO | Iterable[str],
+    file: Union[TextIO, Iterable[str]],
     source_sections: SourceSections,
     source_kvs: SourceKvs,
     mutations: Mutations,
@@ -162,50 +163,56 @@ def process_target(
     seen_keys = set()
     cur_section = OUTSIDE_SECTION
     for data in load_ini(file):
-        match data:
-            case (LineType.Comment, line):
+        if (len(data) > 1) and (data[0] is LineType.Comment):
+            line = data[1]
+            yield line
+        elif (len(data) > 2) and (data[0] is LineType.SectionHeader):
+            line = data[1]
+            section = data[2]
+            # Track state to deal with keys existing in source but not target
+            if cur_section in source_sections.keys() and not is_section_ignored(
+                cur_section, mutations
+            ):
+                unseen_keys = set(source_kvs[cur_section].keys()).difference(
+                    seen_keys
+                )
+                for k in sorted(unseen_keys):
+                    if not is_key_ignored(cur_section, k, mutations):
+                        if (cur_section, k) in mutations.transforms:
+                            yield mutations.transforms[(cur_section, k)](
+                                cur_section, k, source_kvs[cur_section][k], None
+                            )
+                        else:
+                            yield source_kvs[cur_section][k][0]
+            seen_sections.add(section)
+            seen_keys = set()
+            cur_section = section
+            # Back to handling things that exist in the target
+            if is_section_ignored(section, mutations):
                 yield line
-            case (LineType.SectionHeader, line, section):
-                # Track state to deal with keys existing in source but not target
-                if cur_section in source_sections.keys() and not is_section_ignored(
-                    cur_section, mutations
-                ):
-                    unseen_keys = set(source_kvs[cur_section].keys()).difference(
-                        seen_keys
+            elif section in source_sections:
+                yield source_sections[section]
+        elif (len(data) > 4) and (data[0] is LineType.KeyValue):
+            line = data[1]
+            section = data[2]
+            key = data[3]
+            value = data[4]
+            # Keep track of seen keys so we can later on deal with things
+            # missing in target but found in source.
+            seen_keys.add(key)
+            # Back to handling things that exist in the target
+            if is_key_ignored(section, key, mutations):
+                yield line
+            elif section in source_kvs and key in source_kvs[section]:
+                if (section, key) in mutations.transforms:
+                    src_data = None
+                    if section in source_kvs and key in source_kvs[section]:
+                        src_data = source_kvs[section][key]
+                    yield mutations.transforms[(section, key)](
+                        section, key, src_data, (line, value)
                     )
-                    for k in sorted(unseen_keys):
-                        if not is_key_ignored(cur_section, k, mutations):
-                            if (cur_section, k) in mutations.transforms:
-                                yield mutations.transforms[(cur_section, k)](
-                                    cur_section, k, source_kvs[cur_section][k], None
-                                )
-                            else:
-                                yield source_kvs[cur_section][k][0]
-                seen_sections.add(section)
-                seen_keys = set()
-                cur_section = section
-                # Back to handling things that exist in the target
-                if is_section_ignored(section, mutations):
-                    yield line
-                elif section in source_sections:
-                    yield source_sections[section]
-            case (LineType.KeyValue, line, section, key, value):
-                # Keep track of seen keys so we can later on deal with things
-                # missing in target but found in source.
-                seen_keys.add(key)
-                # Back to handling things that exist in the target
-                if is_key_ignored(section, key, mutations):
-                    yield line
-                elif section in source_kvs and key in source_kvs[section]:
-                    if (section, key) in mutations.transforms:
-                        src_data = None
-                        if section in source_kvs and key in source_kvs[section]:
-                            src_data = source_kvs[section][key]
-                        yield mutations.transforms[(section, key)](
-                            section, key, src_data, (line, value)
-                        )
-                    else:
-                        yield source_kvs[section][key][0]
+                else:
+                    yield source_kvs[section][key][0]
     # Handle extra sections in source state
     for section in sorted(set(source_sections.keys()).difference(seen_sections)):
         # Before the first section. Special case handled above in case LineType.SectionHeader
